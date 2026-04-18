@@ -40,7 +40,8 @@ jobs:
               print("[probe] starting nodriver...", flush=True)
               browser = await uc.start(
                   headless=False,
-                  browser_args=["--no-sandbox", "--disable-dev-shm-usage"],
+                  no_sandbox=True,
+                  browser_args=["--disable-dev-shm-usage"],
               )
               print("[probe] browser started, navigating to DoneDeal...", flush=True)
               page = await browser.get("https://www.donedeal.ie/cars")
