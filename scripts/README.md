@@ -1,15 +1,37 @@
 # DoneDeal → Lovable Cloud data pipeline
 
-Two small Python workers feed your Lovable Cloud database on a 90-minute cron via GitHub Actions.
+One Python worker feeds your Lovable Cloud database on a 2-hour cron via GitHub Actions. It POSTs to two Lovable Cloud edge functions (not directly to the DB) using a shared API key.
 
 ```
 scripts/
-├── scrape_worker.py   # scrape DoneDeal, upsert → listings
-├── score_worker.py    # fit price model per (make,model), upsert → outliers, fan out alerts
-└── requirements.txt   # worker-specific deps
+├── etl_worker.py       # scrape + transform + POST to ingest-listings, score in-memory + POST to ingest-outliers
+└── requirements.txt    # worker deps
 
-.github/workflows/etl.yml   # runs both on a cron
+.github/workflows/etl.yml   # runs the worker on a cron
 ```
+
+---
+
+## Architecture
+
+Lovable Cloud does not expose raw Supabase `service_role` credentials, so the Python worker can't write to the database directly. Instead the flow is:
+
+```
+GitHub Actions (every 2h)
+        │
+        ▼
+scripts/etl_worker.py
+  1. scrape DoneDeal → pandas DataFrame
+  2. clean + transform → listing rows
+  3. POST  ──→  ingest-listings  (edge fn in Lovable Cloud)
+                     └─→ upserts listings table
+  4. score in-memory (linear regression per make+model)
+  5. POST  ──→  ingest-outliers  (edge fn in Lovable Cloud)
+                     ├─→ upserts outliers + price_models
+                     └─→ calls fan_out_alerts() → notifications
+```
+
+Both edge functions are protected with a shared secret via `x-api-key` header.
 
 ---
 
@@ -17,31 +39,45 @@ scripts/
 
 ### 1. Confirm the schema is applied in Lovable Cloud
 
-Open your Lovable project → **Cloud → Database → SQL editor** and run the schema block from `LOVABLE_BUILD_GUIDE.md` (§3). Lovable Cloud exposes a full Postgres SQL editor — it's the same thing underneath.
+Open your Lovable project → **Cloud → Database → SQL editor** and run the schema block from `LOVABLE_BUILD_GUIDE.md` (§3). You also need the `fan_out_alerts()` function and a `price_models` table; both are in §5 and §3 of the build guide respectively.
 
-You also need the `fan_out_alerts()` function and a `price_models` table; both are in §5 and §3 of the build guide respectively. Paste and run those too.
+### 2. Confirm the two edge functions are deployed
 
-### 2. Grab the credentials
+In Lovable → **Cloud → Edge functions**, you should see:
 
-In Lovable → **Cloud → API / Connect** (label may vary), copy:
+- `ingest-listings` — accepts `{ "rows": [...] }`, upserts into `listings`
+- `ingest-outliers` — accepts `{ "rows": [...], "price_models": [...] }`, upserts into `outliers` and `price_models`, then calls `fan_out_alerts()`
 
-- **Project URL** (looks like `https://xyz.supabase.co`)
-- **`service_role` key** — NOT the anon key. The service role key bypasses RLS, which is what the workers need.
+Both should check the `x-api-key` header against the `INGEST_API_KEY` secret stored inside Lovable Cloud.
 
-Keep the service role key secret. Never commit it, never put it in the frontend.
+### 3. Add the shared API key as a Lovable Cloud secret
 
-### 3. Push this repo to GitHub
+In Lovable → **Cloud → Secrets**, add:
 
-If it isn't already on GitHub, create a repo and push. The workflow file at `.github/workflows/etl.yml` will light up automatically.
+| Name              | Value                              |
+|-------------------|------------------------------------|
+| `INGEST_API_KEY`  | a long random string (keep secret) |
 
-### 4. Add GitHub secrets
+The same value will be used on the GitHub side in step 5.
+
+### 4. Grab the two edge function URLs
+
+In Lovable → **Cloud → Edge functions → [function name]**, copy the invocation URL for each. They look like:
+
+```
+https://<project-id>.supabase.co/functions/v1/ingest-listings
+https://<project-id>.supabase.co/functions/v1/ingest-outliers
+```
+
+### 5. Add GitHub secrets
 
 Repo → **Settings → Secrets and variables → Actions → New repository secret**. Add:
 
 | Name                    | Value                                          |
 |-------------------------|------------------------------------------------|
-| `SUPABASE_URL`          | your Lovable Cloud project URL                 |
-| `SUPABASE_SERVICE_KEY`  | your Lovable Cloud `service_role` key          |
+| `INGEST_LISTINGS_URL`   | the ingest-listings edge function URL          |
+| `INGEST_OUTLIERS_URL`   | the ingest-outliers edge function URL          |
+| `INGEST_API_KEY`        | the same value you put in Lovable Cloud above  |
 
 Optionally, under **Variables** (same page, Variables tab), add:
 
@@ -51,21 +87,23 @@ Optionally, under **Variables** (same page, Variables tab), add:
 
 Leave `SCRAPE_MAKES` unset to scrape everything DoneDeal returns on its default search.
 
-### 5. Do a manual test run
+### 6. Do a manual test run
 
-Repo → **Actions → DoneDeal ETL → Run workflow**. It'll take a few minutes on the first run. Watch the logs — you want to see lines like:
+Repo → **Actions → DoneDeal ETL → Run workflow**. It takes a few minutes on the first run. Watch the logs — you should see lines like:
 
 ```
-[scrape] cleaned DataFrame has 847 rows
-[transform] 832 rows ready for upsert
-[upsert] wrote 500/832
-[upsert] wrote 832/832
+[scrape] cleaned DataFrame: 847 rows
+[transform] 832 rows ready for ingest-listings
+[post] ingest-listings: 200/832
+[post] ingest-listings: 400/832
+[post] ingest-listings: 600/832
+[post] ingest-listings: 832/832
 [score] scored 721 rows across 38 (make,model) groups; skipped 14 thin groups
-[upsert outliers] 721/721
-[done] flagged 23 underpriced listings this run
+[post] ingest-outliers response: {"ok":true,"written":721,"models":38,"alerts_fanned":23}
+[done] 832 listings, 721 scored, 23 flagged underpriced, 38 models refreshed
 ```
 
-### 6. Verify in Lovable
+### 7. Verify in Lovable
 
 Open your Lovable app's Search page — listings should now appear. Flip to Explore — any underpriced ones from the run will be there. If Alerts is on for your user, you should have a notification in the bell drawer.
 
@@ -73,21 +111,21 @@ Open your Lovable app's Search page — listings should now appear. Flip to Expl
 
 ## Local development (optional)
 
-You can run the workers from your machine the same way GitHub Actions does:
+You can run the worker from your machine the same way GitHub Actions does:
 
 ```bash
 pip install -e .
 pip install -r scripts/requirements.txt
 
-export SUPABASE_URL="https://xyz.supabase.co"
-export SUPABASE_SERVICE_KEY="eyJ..."
+export INGEST_LISTINGS_URL="https://<project>.supabase.co/functions/v1/ingest-listings"
+export INGEST_OUTLIERS_URL="https://<project>.supabase.co/functions/v1/ingest-outliers"
+export INGEST_API_KEY="…"
 export SCRAPE_MAKES="BMW,Mercedes-Benz"   # optional
 
-python scripts/scrape_worker.py
-python scripts/score_worker.py
+python scripts/etl_worker.py
 ```
 
-Useful for faster iteration when debugging the transforms — each run writes to the same DB, which the Lovable preview will reflect live.
+Useful for faster iteration when debugging the transforms — each run writes to the same DB, which the Lovable preview reflects live.
 
 ---
 
@@ -103,26 +141,32 @@ For each `(make, model)` with at least 30 active listings:
    - `pct_below ≥ 0.15` (at least 15% under predicted — avoids trivially-cheap-but-noisy calls)
    - `pct_below ≤ 0.60` (filters out obvious scam listings)
 
-Tune `MIN_GROUP_SIZE`, `Z_THRESHOLD`, `MIN_PCT_BELOW`, and `MAX_PCT_BELOW` at the top of `score_worker.py` once you see how the data looks in practice.
+Tune `MIN_GROUP_SIZE`, `Z_THRESHOLD`, `MIN_PCT_BELOW`, and `MAX_PCT_BELOW` at the top of `etl_worker.py` once you see how the data looks in practice.
 
 ---
 
 ## Troubleshooting
 
-**"401 Unauthorized" on upsert** — you're using the anon key, not the service role key. The service role key is the longer one labelled `service_role` in your Lovable Cloud API panel.
+**"401 Unauthorized" from either edge function** — the `INGEST_API_KEY` secret in GitHub Actions doesn't match the one stored in Lovable Cloud. They must be byte-for-byte identical.
+
+**"404 Not Found" on the edge function URL** — double-check the URLs in GitHub secrets. The edge-function URL is under Cloud → Edge functions → [function] in Lovable, not the project-level URL.
 
 **Listings appear but no outliers** — check the scorer logs. If every group is "skipped thin", you don't have enough volume yet per model. Either lower `MIN_GROUP_SIZE` (not recommended below 20) or widen your scrape.
 
-**Scraper returns 0 rows** — DoneDeal has likely changed its HTML structure, which breaks the regex patterns in `donedeal/constants.py`. This is rare but inevitable. Test the scraper locally first (`python -c "import donedeal as dd; s = dd.CarScraper(); s.scrape(); print(len(s.DataFrame))"`).
+**Scraper returns 0 rows** — DoneDeal has likely changed its HTML structure, which breaks the regex patterns in `donedeal/constants.py`. Test the scraper locally first:
+```
+python -c "import donedeal as dd; s = dd.CarScraper(); s.scrape(); print(len(s.DataFrame))"
+```
 
-**`fan_out_alerts` RPC not found** — the scorer will log and continue. Paste the function from `LOVABLE_BUILD_GUIDE.md` §5 into your Lovable Cloud SQL editor.
+**`fan_out_alerts` RPC not found** — the edge function will log and continue (or fail, depending on how it's written). Paste the function from `LOVABLE_BUILD_GUIDE.md` §5 into your Lovable Cloud SQL editor.
 
-**Workflow runs too often** — the cron is `*/90 * * * *`. Note: standard cron doesn't support `*/90`. GitHub Actions interprets it as "every 90th minute of the hour" which fires at `:00` only. If you want true 90-minute spacing, change the cron to `0 */2 * * *` (every 2 hours) or `0,30 * * * *` (every 30 min) and accept a different cadence.
+**Changing the schedule** — edit `.github/workflows/etl.yml`. Default is `0 */2 * * *` (every 2 hours on the hour). Common alternatives: `0,30 * * * *` (every 30 min), `*/15 * * * *` (every 15 min). GitHub Actions cron doesn't support non-uniform intervals like `*/90`.
 
 ---
 
 ## What lives where
 
 - **Frontend** (Lovable project) — reads from `v_listings_scored`, writes to `alert_prefs` and `notifications`. Never writes to `listings` or `outliers`.
-- **Workers** (this repo, via GitHub Actions) — write to `listings`, `outliers`, `price_models`; call `fan_out_alerts()`. Never read notifications.
+- **Edge functions** (Lovable Cloud) — the only things that write to `listings`, `outliers`, `price_models`, and call `fan_out_alerts()`. They're the trust boundary.
+- **Worker** (this repo, via GitHub Actions) — scrapes, scores, and POSTs to the edge functions. Knows nothing about the DB schema directly.
 - **Users** — only touch `alert_prefs` and `notifications` (their own rows, enforced by RLS).
