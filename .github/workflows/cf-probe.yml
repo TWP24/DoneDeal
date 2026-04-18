@@ -13,19 +13,29 @@ on:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Confirm Chrome is available + install xvfb
+      - name: Environment check
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-          which google-chrome || which google-chrome-stable || true
-          google-chrome --version || google-chrome-stable --version || echo "NO CHROME FOUND"
+          echo "=== Chrome detection ==="
+          which google-chrome && google-chrome --version || echo "no google-chrome"
+          which google-chrome-stable && google-chrome-stable --version || echo "no google-chrome-stable"
+          which chromium-browser && chromium-browser --version || echo "no chromium-browser"
+          echo "=== user ==="
+          whoami
+          id
+
+      - name: Smoke-test Chrome headless directly
+        run: |
+          google-chrome --headless=new --disable-gpu --no-sandbox --dump-dom https://example.com \
+            | head -c 200
+          echo ""
+          echo "[chrome smoke test OK]"
 
       - name: Install nodriver
         run: pip install nodriver
@@ -33,16 +43,27 @@ jobs:
       - name: Write probe script
         run: |
           cat > probe.py << 'PYEOF'
-          import re, json, asyncio, sys
+          import re, json, asyncio, sys, os
           import nodriver as uc
 
           async def main():
-              print("[probe] starting nodriver...", flush=True)
-              browser = await uc.start(
-                  headless=False,
-                  no_sandbox=True,
-                  browser_args=["--disable-dev-shm-usage"],
-              )
+              print(f"[probe] python={sys.version}", flush=True)
+              print(f"[probe] user={os.getuid()}", flush=True)
+              print("[probe] starting nodriver (headless=True, no_sandbox=True)...", flush=True)
+              try:
+                  browser = await uc.start(
+                      headless=True,
+                      no_sandbox=True,
+                      browser_executable_path="/usr/bin/google-chrome",
+                      browser_args=[
+                          "--disable-dev-shm-usage",
+                          "--disable-gpu",
+                          "--disable-blink-features=AutomationControlled",
+                      ],
+                  )
+              except Exception as e:
+                  print(f"[probe] BROWSER LAUNCH FAILED: {type(e).__name__}: {e}", flush=True)
+                  raise
               print("[probe] browser started, navigating to DoneDeal...", flush=True)
               page = await browser.get("https://www.donedeal.ie/cars")
 
@@ -65,7 +86,7 @@ jobs:
                   )
                   marker = "CF!" if cf_challenge else "   "
                   print(
-                      f"[probe] t+{(i+1)*2:>3}s {marker} title={title!r:<50}  "
+                      f"[probe] t+{(i+1)*2:>3}s {marker} title={title!r:<55}  "
                       f"__NEXT_DATA__={has_next}  cars-for-sale-links={hits}  html_len={len(html)}",
                       flush=True,
                   )
@@ -102,5 +123,5 @@ jobs:
           uc.loop().run_until_complete(main())
           PYEOF
 
-      - name: Run probe under Xvfb
-        run: xvfb-run -a --server-args="-screen 0 1280x1024x24" python probe.py
+      - name: Run probe
+        run: python probe.py
