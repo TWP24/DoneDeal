@@ -1,0 +1,105 @@
+name: Cloudflare Probe (DoneDeal + nodriver)
+
+# Throwaway diagnostic: tries to fetch DoneDeal's car search page from a
+# GitHub Actions runner using nodriver (undetected Chrome). Tells us whether
+# Cloudflare blocks Azure/GitHub IPs even when the browser fingerprint is clean.
+#
+# Trigger manually: Actions tab -> "Cloudflare Probe (DoneDeal + nodriver)"
+# -> Run workflow. Takes ~2 min.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Confirm Chrome is available + install xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          which google-chrome || which google-chrome-stable || true
+          google-chrome --version || google-chrome-stable --version || echo "NO CHROME FOUND"
+
+      - name: Install nodriver
+        run: pip install nodriver
+
+      - name: Write probe script
+        run: |
+          cat > probe.py << 'PYEOF'
+          import re, json, asyncio, sys
+          import nodriver as uc
+
+          async def main():
+              print("[probe] starting nodriver...", flush=True)
+              browser = await uc.start(
+                  headless=False,
+                  browser_args=["--no-sandbox", "--disable-dev-shm-usage"],
+              )
+              print("[probe] browser started, navigating to DoneDeal...", flush=True)
+              page = await browser.get("https://www.donedeal.ie/cars")
+
+              cleared = False
+              title = ""
+              last_html = ""
+              for i in range(25):
+                  await page.sleep(2)
+                  html = await page.get_content()
+                  last_html = html
+                  tm = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+                  title = tm.group(1).strip() if tm else "(no title)"
+                  has_next = "__NEXT_DATA__" in html
+                  hits = html.count("/cars-for-sale/")
+                  cf_challenge = (
+                      "Just a moment" in html
+                      or "Security Check" in html
+                      or "__cf_chl" in html
+                      or "challenge-platform" in html
+                  )
+                  marker = "CF!" if cf_challenge else "   "
+                  print(
+                      f"[probe] t+{(i+1)*2:>3}s {marker} title={title!r:<50}  "
+                      f"__NEXT_DATA__={has_next}  cars-for-sale-links={hits}  html_len={len(html)}",
+                      flush=True,
+                  )
+                  if has_next and hits > 10:
+                      cleared = True
+                      break
+
+              if cleared:
+                  m = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>', last_html)
+                  start = m.end()
+                  end = last_html.find("</script>", start)
+                  try:
+                      data = json.loads(last_html[start:end])
+                      ads = data.get("props", {}).get("pageProps", {}).get("ads", [])
+                      print(f"\n[probe] PASSED  title={title!r}  ads_on_page={len(ads)}", flush=True)
+                      if ads:
+                          first = ads[0]
+                          print(
+                              f"[probe] sample ad: id={first.get('id')} "
+                              f"title={first.get('title')!r} "
+                              f"price={first.get('priceInfo', {}).get('priceInEuro')}",
+                              flush=True,
+                          )
+                      sys.exit(0)
+                  except Exception as e:
+                      print(f"\n[probe] FAILED (parse): {e}", flush=True)
+                      sys.exit(2)
+              else:
+                  print(f"\n[probe] FAILED  title={title!r}  html_len={len(last_html)}", flush=True)
+                  print("[probe] first 3KB of last html for diagnosis:", flush=True)
+                  print(last_html[:3000], flush=True)
+                  sys.exit(1)
+
+          uc.loop().run_until_complete(main())
+          PYEOF
+
+      - name: Run probe under Xvfb
+        run: xvfb-run -a --server-args="-screen 0 1280x1024x24" python probe.py
