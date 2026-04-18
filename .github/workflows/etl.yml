@@ -1,9 +1,7 @@
 name: DoneDeal ETL
 
-# Runs the scraper, then the scorer, every 2 hours.
+# Runs scrape + score + ingest in a single pass, every 2 hours.
 # Also runnable manually from the GitHub Actions UI for testing.
-# (Standard cron doesn't support 90-minute intervals cleanly.
-#  Change to "0,30 * * * *" if you want every 30 minutes.)
 on:
   schedule:
     - cron: "0 */2 * * *"
@@ -20,8 +18,9 @@ jobs:
     timeout-minutes: 45
 
     env:
-      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      INGEST_LISTINGS_URL: ${{ secrets.INGEST_LISTINGS_URL }}
+      INGEST_OUTLIERS_URL: ${{ secrets.INGEST_OUTLIERS_URL }}
+      INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
       # Optional: restrict to specific makes. Comma separated.
       SCRAPE_MAKES: ${{ vars.SCRAPE_MAKES }}
 
@@ -41,8 +40,5 @@ jobs:
           pip install -e .                        # installs the `donedeal` package
           pip install -r scripts/requirements.txt # worker-specific deps
 
-      - name: Scrape
-        run: python scripts/scrape_worker.py
-
-      - name: Score + fan out alerts
-        run: python scripts/score_worker.py
+      - name: Run ETL
+        run: python scripts/etl_worker.py
